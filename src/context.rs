@@ -505,10 +505,11 @@ fn home_dir(env: &Env) -> Option<PathBuf> {
 }
 
 fn get_config_path_os(env: &Env) -> Option<OsString> {
-    if let Some(config_path) = env.get_env_os("STARSHIP_CONFIG") {
-        return Some(config_path);
+    if let Some(config_line) = env.get_env_os("STARSHIP_CONFIG").filter(|v| !v.is_empty()) {
+        return Some(config_line);
     }
-    Some(home_dir(env)?.join(".config").join("starship.toml").into())
+    let default_path = home_dir(env)?.join(".config").join("starship.toml");
+    Some(default_path.into_os_string())
 }
 
 #[derive(Debug)]

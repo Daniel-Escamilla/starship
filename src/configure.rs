@@ -223,15 +223,34 @@ fn handle_toggle_configuration(doc: &mut DocumentMut, name: &str, key: &str) -> 
     Ok(())
 }
 
+/// Print an error and exit if `STARSHIP_CONFIG` points to more than one file.
+///
+/// `starship config` can only edit a single file; call this guard before any
+/// read-modify-write of the config document.
+fn ensure_single_config_file(context: &Context) {
+    if context
+        .get_config_path_os()
+        .is_some_and(|p| StarshipConfig::has_multiple_files(&p.to_string_lossy()))
+    {
+        eprintln!("Error: starship config does not support editing multiple configuration files");
+        eprintln!("Please edit the individual files directly");
+        process::exit(1);
+    }
+}
+
 pub fn get_configuration(context: &Context) -> toml::Table {
-    let starship_config = StarshipConfig::initialize(context.get_config_path_os().as_deref());
+    let starship_config =
+        StarshipConfig::initialize_with_context(context.get_config_path_os().as_deref(), true);
 
     starship_config.config.unwrap_or_default()
 }
 
 pub fn get_configuration_edit(context: &Context) -> DocumentMut {
+    ensure_single_config_file(context);
     let config_file_path = context.get_config_path_os();
-    let toml_content = StarshipConfig::read_config_content_as_str(config_file_path.as_deref());
+    let toml_content = config_file_path
+        .as_deref()
+        .and_then(|path| StarshipConfig::read_config_content_as_str(path, true));
 
     toml_content
         .unwrap_or_default()
@@ -240,6 +259,7 @@ pub fn get_configuration_edit(context: &Context) -> DocumentMut {
 }
 
 pub fn write_configuration(context: &Context, doc: &DocumentMut) {
+    ensure_single_config_file(context);
     let config_path = context.get_config_path_os().unwrap_or_else(|| {
         eprintln!("config path required to write configuration");
         process::exit(1);
@@ -256,6 +276,7 @@ pub fn edit_configuration(
     context: &Context,
     editor_override: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_single_config_file(context);
     // Argument currently only used for testing, but could be used to specify
     // an editor override on the command line.
     let config_path = context.get_config_path_os().unwrap_or_else(|| {
@@ -599,6 +620,9 @@ mod tests {
     const PRINT_CONFIG_DEFAULT: &str = "[custom]";
     const PRINT_CONFIG_HOME: &str = "[custom.home]";
     const PRINT_CONFIG_ENV: &str = "[custom.STARSHIP_CONFIG]";
+    const PRINT_CONFIG_MERGED: &str = "[custom.merged]";
+    const PRINT_CONFIG_FIRST_ONLY: &str = "[custom.first_only]";
+    const PRINT_CONFIG_SECOND_ONLY: &str = "[custom.second_only]";
 
     #[test]
     fn print_configuration_scenarios() -> io::Result<()> {
@@ -626,6 +650,66 @@ mod tests {
             StarshipConfigEnvScenario::ExistingFile,
             PRINT_CONFIG_ENV,
         )?;
+        run_print_configuration_test(
+            "STARSHIP_CONFIG=first.toml:second.toml (both exist) uses merged config",
+            true,
+            StarshipConfigEnvScenario::MultipleFiles,
+            PRINT_CONFIG_MERGED,
+        )?;
+        run_print_configuration_test(
+            "STARSHIP_CONFIG=exists.toml:missing.toml uses first file only",
+            true,
+            StarshipConfigEnvScenario::MultipleFilesFirstExists,
+            PRINT_CONFIG_FIRST_ONLY,
+        )?;
+        run_print_configuration_test(
+            "STARSHIP_CONFIG=missing.toml:exists.toml uses second file only",
+            true,
+            StarshipConfigEnvScenario::MultipleFilesSecondExists,
+            PRINT_CONFIG_SECOND_ONLY,
+        )?;
+        run_print_configuration_test(
+            "STARSHIP_CONFIG=missing1.toml:missing2.toml (both missing) uses default",
+            false,
+            StarshipConfigEnvScenario::MultipleFilesNoneExist,
+            PRINT_CONFIG_DEFAULT,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn print_configuration_scenarios_unix() -> io::Result<()> {
+        run_print_configuration_test(
+            "Unix: colon-separated paths uses merged config",
+            true,
+            StarshipConfigEnvScenario::MultipleFilesUnix,
+            PRINT_CONFIG_MERGED,
+        )?;
+        run_print_configuration_test(
+            "Unix: single absolute path uses that file",
+            true,
+            StarshipConfigEnvScenario::SingleFileUnix,
+            PRINT_CONFIG_ENV,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn print_configuration_scenarios_windows() -> io::Result<()> {
+        run_print_configuration_test(
+            "Windows: semicolon-separated paths uses merged config",
+            true,
+            StarshipConfigEnvScenario::MultipleFilesWindows,
+            PRINT_CONFIG_MERGED,
+        )?;
+        run_print_configuration_test(
+            "Windows: single file with drive letter uses that file",
+            true,
+            StarshipConfigEnvScenario::SingleFileWindows,
+            PRINT_CONFIG_ENV,
+        )?;
         Ok(())
     }
 
@@ -634,6 +718,18 @@ mod tests {
         NotSpecified,
         NonExistingFile,
         ExistingFile,
+        MultipleFiles,
+        MultipleFilesFirstExists,
+        MultipleFilesSecondExists,
+        MultipleFilesNoneExist,
+        #[cfg(not(windows))]
+        MultipleFilesUnix,
+        #[cfg(not(windows))]
+        SingleFileUnix,
+        #[cfg(windows)]
+        MultipleFilesWindows,
+        #[cfg(windows)]
+        SingleFileWindows,
     }
 
     fn run_print_configuration_test(
@@ -664,19 +760,87 @@ mod tests {
             home_file.write_all(PRINT_CONFIG_HOME.as_bytes())?;
         }
 
-        let env_starship_config = match starship_config_env_scenario {
+        let env_starship_config: Option<String> = match starship_config_env_scenario {
             StarshipConfigEnvScenario::NotSpecified => None,
-            StarshipConfigEnvScenario::NonExistingFile => Some(env_toml),
+            StarshipConfigEnvScenario::NonExistingFile => {
+                Some(env_toml.to_string_lossy().to_string())
+            }
             StarshipConfigEnvScenario::ExistingFile => {
                 let mut env_toml_file = File::create(&env_toml)?;
                 env_toml_file.write_all(PRINT_CONFIG_ENV.as_bytes())?;
-                Some(env_toml)
+                Some(env_toml.to_string_lossy().to_string())
+            }
+            StarshipConfigEnvScenario::MultipleFiles => {
+                let first = dir.path().join("first.toml");
+                let second = dir.path().join("second.toml");
+                File::create(&first)?.write_all(PRINT_CONFIG_MERGED.as_bytes())?;
+                File::create(&second)?.write_all("[custom.additional]".as_bytes())?;
+                let joined = std::env::join_paths([first, second])
+                    .map_err(io::Error::other)?
+                    .to_string_lossy()
+                    .to_string();
+                Some(joined)
+            }
+            StarshipConfigEnvScenario::MultipleFilesFirstExists => {
+                let first = dir.path().join("first.toml");
+                let second = dir.path().join("nonexistent.toml");
+                File::create(&first)?.write_all(PRINT_CONFIG_FIRST_ONLY.as_bytes())?;
+                let joined = std::env::join_paths([first, second])
+                    .map_err(io::Error::other)?
+                    .to_string_lossy()
+                    .to_string();
+                Some(joined)
+            }
+            StarshipConfigEnvScenario::MultipleFilesSecondExists => {
+                let first = dir.path().join("nonexistent.toml");
+                let second = dir.path().join("second.toml");
+                File::create(&second)?.write_all(PRINT_CONFIG_SECOND_ONLY.as_bytes())?;
+                let joined = std::env::join_paths([first, second])
+                    .map_err(io::Error::other)?
+                    .to_string_lossy()
+                    .to_string();
+                Some(joined)
+            }
+            StarshipConfigEnvScenario::MultipleFilesNoneExist => {
+                let first = dir.path().join("nonexistent1.toml");
+                let second = dir.path().join("nonexistent2.toml");
+                let joined = std::env::join_paths([first, second])
+                    .map_err(io::Error::other)?
+                    .to_string_lossy()
+                    .to_string();
+                Some(joined)
+            }
+            #[cfg(not(windows))]
+            StarshipConfigEnvScenario::MultipleFilesUnix => {
+                let first = dir.path().join("first.toml");
+                let second = dir.path().join("second.toml");
+                File::create(&first)?.write_all(PRINT_CONFIG_MERGED.as_bytes())?;
+                File::create(&second)?.write_all("[custom.additional]".as_bytes())?;
+                Some(format!("{}:{}", first.display(), second.display()))
+            }
+            #[cfg(not(windows))]
+            StarshipConfigEnvScenario::SingleFileUnix => {
+                File::create(&env_toml)?.write_all(PRINT_CONFIG_ENV.as_bytes())?;
+                Some(env_toml.to_string_lossy().to_string())
+            }
+            #[cfg(windows)]
+            StarshipConfigEnvScenario::MultipleFilesWindows => {
+                let first = dir.path().join("first.toml");
+                let second = dir.path().join("second.toml");
+                File::create(&first)?.write_all(PRINT_CONFIG_MERGED.as_bytes())?;
+                File::create(&second)?.write_all("[custom.additional]".as_bytes())?;
+                Some(format!("{};{}", first.display(), second.display()))
+            }
+            #[cfg(windows)]
+            StarshipConfigEnvScenario::SingleFileWindows => {
+                File::create(&env_toml)?.write_all(PRINT_CONFIG_ENV.as_bytes())?;
+                Some(env_toml.to_string_lossy().to_string())
             }
         };
 
         let mut env = Env::default();
         if let Some(v) = env_starship_config {
-            env.insert("STARSHIP_CONFIG", v.to_string_lossy().to_string());
+            env.insert("STARSHIP_CONFIG", v);
         }
         env.insert(
             "HOME",

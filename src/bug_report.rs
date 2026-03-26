@@ -236,16 +236,21 @@ fn get_config_path(shell: &str) -> Option<PathBuf> {
 }
 
 fn get_starship_config() -> String {
-    std::env::var("STARSHIP_CONFIG")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| {
-            utils::home_dir().map(|mut home_dir| {
-                home_dir.push(".config/starship.toml");
-                home_dir
-            })
-        })
-        .and_then(|config_path| fs::read_to_string(config_path).ok())
+    use crate::config::StarshipConfig;
+    use std::ffi::OsStr;
+
+    // Resolve the config path(s) the same way the runtime does.
+    let config_path: std::ffi::OsString =
+        match std::env::var_os("STARSHIP_CONFIG").filter(|v| !v.is_empty()) {
+            Some(v) => v,
+            None => match utils::default_starship_config_path(None) {
+                Some(p) => p.into_os_string(),
+                None => return UNKNOWN_CONFIG.to_string(),
+            },
+        };
+
+    // read_config_content_as_str handles both single and multiple paths.
+    StarshipConfig::read_config_content_as_str(OsStr::new(&config_path), false)
         .unwrap_or_else(|| UNKNOWN_CONFIG.to_string())
 }
 
